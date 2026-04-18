@@ -52,7 +52,6 @@ if __name__ == "__main__":
         help="The number of episodes to run")
 
     args = parser.parse_args()
-    print()
 
     max_steps = 4000
     env = gym.make('MountainCarContinuous-v0', max_episode_steps=max_steps)
@@ -187,7 +186,7 @@ if __name__ == "__main__":
             env,
             #episode_trigger=lambda num: num % 2 == 0,
             video_folder="./",
-            name_prefix="mountain-car",
+            name_prefix=f"mountain-car-{args.algorithm}",
         )
     else:
         env = gym.make('MountainCarContinuous-v0', max_episode_steps=4000, render_mode="human")
