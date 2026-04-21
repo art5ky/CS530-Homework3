@@ -1,26 +1,45 @@
+"""
+Rutgers University, Spring 2026
+CS530, Homework 3 - DQN Agent and Discretized Agent
+Written by: Arthur Levitsky
+"""
+
 import argparse
 import gymnasium as gym
-import pickle
 import random
 import numpy as np
 import torch 
 import torch.nn as nn
 from collections import deque
 
-def modifyReward(state, next_state, action, reward):
+# The DQN network that takes in the observations and outputs Q-values for the discrete actions. 
+class DQN(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def modifyReward(next_state):
     """
-    Modify the reward so that your DQN policy search succeeds.
+    For calculating DQN reward, utilizing the mechanical energy formula.
+    The agent is encouraged to stay out of the bottom of the valley through potential energy. 
+    The agent is also encouraged to increase speed through it's actions and momentum via kinetic energy.
+    If agent is at position 0.45 (the flag), give a big reward to signify that reaching the flag is the ultimate objective.
     """
     position, velocity = next_state
 
     if position >= 0.45:
         return 100.0
-    
-    #currently, reward for kinetic energy and potential energy
-    custom_reward = abs(velocity) * 10 + abs(position + 0.5)
 
-    return custom_reward
-
+    # We scale reward from velocity higher to make sure that the agent doesn't just prioritize being on the slopes of the hills. 
+    return abs(velocity) * 20 + abs(position + 0.5)
 
 def discretizeState(state):
     """
@@ -61,81 +80,66 @@ if __name__ == "__main__":
     # We know the vehicle position and speed
     print(f"Observation space: {env.observation_space}")
 
-    # --- Pre-Training Setup ---
-    # 1. Map discrete actions to continuous environment inputs
-    discrete_actions = [[-1.0], [0.0], [1.0]] 
-    num_actions = len(discrete_actions)
+    # By default, program will run the DQN approach.
+    if args.algorithm == 'dqn':
 
-    # 2. Define the Deep Q-Network
-    class QNetwork(nn.Module):
-        def __init__(self, state_dim, action_dim):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, 64),
-                nn.ReLU(),
-                nn.Linear(64, action_dim)
-            )
-        def forward(self, x):
-            return self.net(x)
+        discrete_actions = [[-1.0], [-0.5], [0.0], [0.5], [1.0]] # Convert continuous actions into three discrete actions.
+        num_actions = len(discrete_actions)
 
-    # 3. Initialize components
-    q_net = QNetwork(state_dim=2, action_dim=num_actions)
-    optimizer = torch.optim.Adam(q_net.parameters(), lr=0.001)
-    loss_fn = nn.MSELoss()
+        policy_dqn = DQN(state_dim=2, action_dim=num_actions)
+        target_dqn = DQN(state_dim=2, action_dim=num_actions)
 
-    # 4. Hyperparameters and Replay Buffer
-    replay_buffer = deque(maxlen=10000)
-    batch_size = 64
-    gamma = 0.99
-    epsilon = 1.0         # Start with 100% random actions
-    epsilon_decay = 0.95 # Multiply epsilon by this after each episode
-    epsilon_min = 0.01    # Never explore less than 1% of the time
-    # --------------------------
+        target_dqn.load_state_dict(policy_dqn.state_dict())
+        target_dqn.eval()
 
-    # The discretized, value-iteration solution does not need training.
-    if args.algorithm != 'discretized':
+        optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=0.001)
+        loss_fn = nn.MSELoss()
+
+        # Hyperparameter and replay buffer initialization
+        replay_buffer = deque(maxlen=10000)
+        batch_size = 64
+        gamma = 0.99
+        epsilon = 1.0 # Start with 100% random actions
+        epsilon_decay = 0.95 # Multiply epsilon by this after each episode
+        epsilon_min = 0.01 # Never explore less than 1% of the time
+        sync_target_dqn_rate = 5
+
         for episode in range(args.episodes):
             # Reset the environment to put the agent into an initial state
             state, info = env.reset()
 
             # Run the simulation
             finished = False
+            is_training = False
 
             sim_steps = 0
             episode_reward = 0.0
 
             while not(finished):
                 sim_steps += 1
-                # TODO Get an action from your model
+
+                # Run epsilon-greedy policy to obtain action on policy network. 
                 if random.random() < epsilon:
-                    # Explore: pick a random action index
                     action_idx = random.randint(0, num_actions - 1)
                 else:
-                    # Exploit: use the network to pick the best action
                     state_tensor = torch.FloatTensor(state).unsqueeze(0)
                     with torch.no_grad():
-                        q_values = q_net(state_tensor)
+                        q_values = policy_dqn(state_tensor)
                     action_idx = torch.argmax(q_values).item()
                 
-                # Map the chosen index back to the format the env expects
                 action = discrete_actions[action_idx]
+                next_state, env_reward, terminated, truncated, info = env.step(action)
+                episode_reward += env_reward
+                
+                reward = modifyReward(next_state)
 
-                next_state, reward, terminated, truncated, info = env.step(action)
-
-                episode_reward += reward
-
-                if args.algorithm == 'dqn':
-                    reward = modifyReward(state, next_state, action, reward)
-
-                # Perform an update step for your deep Q network.
-                # TODO
-                # 1. Store the experience in the replay buffer
+                # Storing the experience in the replay buffer.
                 replay_buffer.append((state, action_idx, reward, next_state, terminated))
 
-                # 2. Only train if we have enough samples in the buffer
-                if len(replay_buffer) >= batch_size:
+                is_training = len(replay_buffer) >= batch_size
+
+                # If we have enough experiences in replay buffer, begin training.
+                if is_training:
                     batch = random.sample(replay_buffer, batch_size)
                     states, actions_batch, rewards, next_states, dones = zip(*batch)
 
@@ -143,24 +147,22 @@ if __name__ == "__main__":
                     actions_tensor = torch.LongTensor(actions_batch).unsqueeze(1)
                     rewards_tensor = torch.FloatTensor(rewards)
                     
-                    # 3. Handle 'None' next_states based on skeleton code logic
-                    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, next_states)), dtype=torch.bool)
-                    non_final_next_states = torch.FloatTensor(np.array([s for s in next_states if s is not None]))
+                    # Q-values obtained from policy network. 
+                    policy_q_values = policy_dqn(states_tensor).gather(1, actions_tensor).squeeze()
 
-                    # Current Q-values for the actions taken
-                    q_values = q_net(states_tensor).gather(1, actions_tensor).squeeze()
-
-                    # Calculate Next Q-values
+                    # Obtain next batch of states Q-values using target network. Filter out next states that are 'None'.
                     next_q_values = torch.zeros(batch_size)
-                    if len(non_final_next_states) > 0:
-                        with torch.no_grad():
-                            next_q_values[non_final_mask] = q_net(non_final_next_states).max(1)[0]
+                    filtered_next_states_mask = torch.tensor([s is not None for s in next_states], dtype=torch.bool)
+                    filtered_next_states_tensor = torch.FloatTensor(np.array([s for s in next_states if s is not None]))
 
-                    # Target Q-values (bellman equation)
+                    with torch.no_grad(): 
+                        next_q_values[filtered_next_states_mask] = target_dqn(filtered_next_states_tensor).max(1)[0]
+
+                    # Update target Q-values using DQL formula.
                     target_q_values = rewards_tensor + (gamma * next_q_values)
 
-                    # 4. Calculate Loss and Backpropagate
-                    loss = loss_fn(q_values, target_q_values)
+                    # Calculate loss and backpropogate on policy network.
+                    loss = loss_fn(policy_q_values, target_q_values)
                     
                     optimizer.zero_grad()
                     loss.backward()
@@ -174,7 +176,13 @@ if __name__ == "__main__":
 
                 finished = terminated or truncated
 
+            # Decay epsilon per episode to decrease exploration.
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
+            
+            # Periodically sync target network.
+            if episode % sync_target_dqn_rate == 0:
+                target_dqn.load_state_dict(policy_dqn.state_dict())
+
             print(f"Episode {episode + 1}/{args.episodes} | Steps: {sim_steps} | Total Reward: {episode_reward:.2f} | Epsilon: {epsilon:.3f}")
     
     env.close()
@@ -205,7 +213,7 @@ if __name__ == "__main__":
             # TODO Get the next action from your DQN
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
             with torch.no_grad():
-                q_values = q_net(state_tensor)
+                q_values = policy_dqn(state_tensor)
             
             action_idx = torch.argmax(q_values).item()
             action = discrete_actions[action_idx]
