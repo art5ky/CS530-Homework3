@@ -190,8 +190,8 @@ if __name__ == "__main__":
     
     # run discrete agent by using argument --algorithm discretized
     elif args.algorithm == 'discretized': 
-        pos_bins = 10
-        vel_bins = 10
+        pos_bins = 30
+        vel_bins = 20
         discrete_actions = [-1.0, -0.5, 0.0, 0.5, 1.0]
         num_actions = len(discrete_actions)
 
@@ -275,8 +275,8 @@ if __name__ == "__main__":
 
     while not(finished):
         if args.algorithm == 'discretized':
-            pos_bins = 10
-            vel_bins = 10
+            pos_bins = 30
+            vel_bins = 20
 
 
             # The discretized model should not require learning, converging instead through value iteration.
