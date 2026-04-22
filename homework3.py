@@ -1,6 +1,6 @@
 """
 Rutgers University, Spring 2026
-CS530, Homework 3 - DQN Agent and Discretized Agent
+CS530, Homework 3 - DQN Agent and Discretized VI Agent
 Written by: Arthur Levitsky
 """
 
@@ -11,6 +11,23 @@ import numpy as np
 import torch 
 import torch.nn as nn
 from collections import deque
+
+# Shared tunable hyperparameters for both DQN and VI agent.
+NUM_ACTIONS = 5
+GAMMA = 0.99
+
+# Tunable hyperparameters specific to DQN agent.
+SYNC_TARGET_DQN_RATE = 10 # Number of episodes until syncing target network with policy network. 
+REPLAY_BUFFER_SIZE = 100000
+BATCH_SIZE = 64
+EPSILON = 1
+EPSILON_DECAY = 0.95 # How decay rate for epsilon per episode.
+EPSILON_MIN = 0.01 # Lower bound for epsilon.
+
+# Tunable hyperparameters specific to VI agent.
+NUM_POS = 100
+NUM_VEL = 100
+THETA = 1e-4
 
 # The DQN network that takes in the observations and outputs Q-values for the discrete actions. 
 class DQN(nn.Module):
@@ -28,31 +45,59 @@ class DQN(nn.Module):
 
 def modifyReward(next_state):
     """
-    For calculating DQN reward, utilizing the mechanical energy formula.
-    The agent is encouraged to stay out of the bottom of the valley through potential energy. 
-    The agent is also encouraged to increase speed through it's actions and momentum via kinetic energy.
-    If agent is at position 0.45 (the flag), give a big reward to signify that reaching the flag is the ultimate objective.
+    For calculating DQN reward, take the absolute value of velocity.
+    This incentivizes the agent to maintain the highest velocity possible at each step.
+    Implicitly, it will force the agent out of the valley.
     """
-    position, velocity = next_state
+    _, velocity = next_state
+    return abs(velocity)
 
-    if position >= 0.45:
-        return 100.0
-
-    # We scale reward from velocity higher to make sure that the agent doesn't just prioritize being on the slopes of the hills. 
-    return abs(velocity) * 20 + abs(position + 0.5)
-
-def discretizeState(state, env, pos_bins=20, vel_bins=20):
+def discretizeState(state, env):
     """
-    Discretize the state. Used with value iteration.
+    Discretize the state. Map the continuous state to a (pos_idx, vel_idx) grid index.
     """
     pos_low, vel_low = env.observation_space.low
     pos_high, vel_high = env.observation_space.high
     position, velocity = state
 
-    pos_idx = int(np.digitize(position, np.linspace(pos_low, pos_high, pos_bins)))
-    vel_idx = int(np.digitize(velocity, np.linspace(vel_low, vel_high, vel_bins)))
+    pos_idx = int(np.digitize(position, np.linspace(pos_low, pos_high, NUM_POS)))
+    vel_idx = int(np.digitize(velocity, np.linspace(vel_low, vel_high, NUM_VEL)))
+
+    pos_idx = np.clip(pos_idx, 0, NUM_POS - 1)
+    vel_idx = np.clip(vel_idx, 0, NUM_VEL - 1)
 
     return (pos_idx, vel_idx)
+
+def createTransitionTable(env):
+        """
+        State transition table created using the environment. This is used for Value Iteration.
+        """
+
+        pos_low, vel_low = env.observation_space.low
+        pos_high, vel_high = env.observation_space.high
+        discrete_actions = np.linspace(env.action_space.low, env.action_space.high, NUM_ACTIONS)
+        discrete_pos = np.linspace(pos_low,  pos_high,  NUM_POS)
+        discrete_vel = np.linspace(vel_low,  vel_high,  NUM_VEL)
+
+        transition_table = {}
+
+        print("Building state transition table...")
+        for i, position in enumerate(discrete_pos):
+            for j, velocity in enumerate(discrete_vel):
+                for k, action in enumerate(discrete_actions):
+
+                    env.reset()
+                    env.unwrapped.state = np.array([position, velocity])
+                    next_state, env_reward, terminated, truncated, info = env.step(action)
+                    next_i, next_j = discretizeState(next_state, env)
+                    done = terminated or truncated
+
+                    # Agent cannot depend on environment rewards alone. We can use modifyReward() function here too like in DQN.
+                    shaped_reward = env_reward + modifyReward(next_state)
+                    transition_table[(i, j, k)] = (next_i, next_j, shaped_reward, done)
+
+        env.close()
+        return transition_table
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -89,11 +134,13 @@ if __name__ == "__main__":
     # By default, program will run the DQN approach.
     if args.algorithm == 'dqn':
 
-        discrete_actions = [[-1.0], [-0.5], [0.0], [0.5], [1.0]] # Convert continuous actions into three discrete actions.
+        # For example, with ACTION_BINS = 5, we have [[-1.0], [-0.5], [0.0], [0.5], [1.0]]
+        discrete_actions = np.linspace(env.action_space.low, env.action_space.high, NUM_ACTIONS)
         num_actions = len(discrete_actions)
+        num_obs = env.observation_space.shape[0]
 
-        policy_dqn = DQN(state_dim=2, action_dim=num_actions)
-        target_dqn = DQN(state_dim=2, action_dim=num_actions)
+        policy_dqn = DQN(state_dim=num_obs, action_dim=num_actions)
+        target_dqn = DQN(state_dim=num_obs, action_dim=num_actions)
 
         target_dqn.load_state_dict(policy_dqn.state_dict())
         target_dqn.eval() # Target network will not be training.
@@ -102,13 +149,13 @@ if __name__ == "__main__":
         loss_fn = nn.MSELoss()
 
         # Hyperparameter and replay buffer initialization
-        replay_buffer = deque(maxlen=10000)
-        batch_size = 64
-        gamma = 0.99
-        epsilon = 1.0 # Start with 100% random actions
-        epsilon_decay = 0.95 # Multiply epsilon by this after each episode
-        epsilon_min = 0.01 # Never explore less than 1% of the time
-        sync_target_dqn_rate = 5
+        replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
+        batch_size = BATCH_SIZE
+        gamma = GAMMA
+        epsilon = EPSILON
+        epsilon_decay = EPSILON_DECAY
+        epsilon_min = EPSILON_MIN
+        sync_target_dqn_rate = SYNC_TARGET_DQN_RATE
 
         for episode in range(args.episodes):
             # Reset the environment to put the agent into an initial state
@@ -187,75 +234,50 @@ if __name__ == "__main__":
                 target_dqn.load_state_dict(policy_dqn.state_dict())
 
             print(f"Episode {episode + 1}/{args.episodes} | Steps: {sim_steps} | Total Reward: {episode_reward:.2f} | Epsilon: {epsilon:.3f}")
-    
-    # run discrete agent by using argument --algorithm discretized
-    elif args.algorithm == 'discretized': 
-        pos_bins = 30
-        vel_bins = 20
-        discrete_actions = [-1.0, -0.5, 0.0, 0.5, 1.0]
-        num_actions = len(discrete_actions)
-
-        q_table = np.zeros((pos_bins + 1, vel_bins + 1, num_actions))
-        flag_state = discretizeState([0.45, 0.0], env, pos_bins, vel_bins)
-        flag_pos_idx, flag_vel_idx = flag_state
-        q_table[flag_pos_idx, :, :] = 100.0
-
-        # Seed high velocity states on the left hill as valuable
-        left_hill_state = discretizeState([-1.0, 0.0], env, pos_bins, vel_bins)
-        left_hill_pos_idx = left_hill_state[0]
-
-        # High rightward velocity columns (right half of vel axis)
-        q_table[left_hill_pos_idx, vel_bins//2:, :] = 25.0
-
-        max_q = np.max(q_table, axis=2)
-        np.savetxt("q_table.csv", max_q, delimiter=',', fmt='%.2f')
-
-        alpha = 0.5 
-        gamma = 0.99
-        epsilon = 1.0 # Start with 100% random actions
-        epsilon_min = 0.01 # Never explore less than 1% of the time
-        target_episode = args.episodes * 10 / 2
-        epsilon_decay = (epsilon_min / epsilon) ** (1 / target_episode) # Multiply epsilon by this after each episode
-
         
-        for episode in range(args.episodes * 10):
-            # Reset the environment to put the agent into an initial state
-            state, info = env.reset()
+        env.close()
 
-            # Run the simulation
-            finished = False
-            state = discretizeState(state, env, pos_bins, vel_bins)
-            sim_steps = 0
-            sim_steps_rate = 500
+    # run discrete VI agent by using argument --algorithm discretized
+    elif args.algorithm == 'discretized': 
 
-            while not(finished):
-                sim_steps += 1
+        # Initialize value and policy tables.
+        V = np.zeros((NUM_POS, NUM_VEL))
+        policy = np.zeros((NUM_POS, NUM_VEL), dtype=int) # will hold the index to the next best action.    
+        transition_table = createTransitionTable(env)
 
-                if random.random() < epsilon: 
-                    action_idx = random.randint(0, num_actions -1)
-                else: 
-                    action_idx = np.argmax(q_table[state])
+        iteration = 0
+        while True: 
+            delta = 0
+            V_new = np.copy(V)
 
-                action = [discrete_actions[action_idx]]
-                next_state, env_reward, terminated, truncated, info = env.step(action)
-                next_state = discretizeState(next_state, env, pos_bins, vel_bins)
+            for i in range(NUM_POS):
+                for j in range(NUM_VEL):
+                    action_values = []
+                    for k in range(NUM_ACTIONS):
+                        next_i, next_j, reward, done = transition_table[(i, j, k)]
 
-                # update Q-table
-                best_next_q = 0 if terminated else np.max(q_table[next_state])
-                q_table[state][action_idx] += alpha * (env_reward + gamma * best_next_q - q_table[state][action_idx])
-                    
-                state = next_state
-                finished = terminated or truncated
+                        if done: # if next state is terminal, take immediate reward.
+                            q = reward
+                        else: 
+                            q = reward + GAMMA * V[next_i, next_j]
+                        
+                        action_values.append(q)
 
-            # Decay epsilon per episode to decrease exploration.
-            epsilon = max(epsilon_min, epsilon * epsilon_decay)
+                    best_action_idx = int(np.argmax(action_values))
+                    V_new[i, j] = action_values[best_action_idx]
+                    policy[i, j] = best_action_idx
 
-            print(f"Episode {episode+1}/{args.episodes * 10} | Steps: {sim_steps} | Epsilon: {epsilon:.3f}")
+                    delta = max(delta, abs(V_new[i, j] - V[i, j]))
+            V = V_new
 
-        max_q = np.max(q_table, axis=2)
-        np.savetxt("q_table_end.csv", max_q, delimiter=',', fmt='%.2f')
+            iteration += 1
+            if iteration % 10 == 0: 
+                print(f"Iteration {iteration} | max delta = {delta:.6f}")
 
-    env.close()
+            if delta < THETA: 
+                print(f"Converged after {iteration} iterations.")
+                break
+                
 
     # Play with policy. If using --record argument, video will be created in directory of file.
     if args.record:
@@ -275,13 +297,13 @@ if __name__ == "__main__":
 
     while not(finished):
         if args.algorithm == 'discretized':
-            pos_bins = 30
-            vel_bins = 20
+            # Get the next action from policy using VI
+            discrete_actions = np.linspace(env.action_space.low, env.action_space.high, NUM_ACTIONS)
 
+            i, j = discretizeState(state, env)
+            action_idx = policy[i, j]
+            action = discrete_actions[action_idx]
 
-            # The discretized model should not require learning, converging instead through value iteration.
-            state_d = discretizeState(state, env, pos_bins, vel_bins)
-            action = [discrete_actions[np.argmax(q_table[state_d])]]
         else:
             # Get the next action from your DQN
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
@@ -292,7 +314,6 @@ if __name__ == "__main__":
             action = discrete_actions[action_idx]
 
         # Take the action
-        #print(f"Taking action {action} from state {state}")
         next_state, reward, terminated, truncated, info = env.step(action)
 
         # Update the state
